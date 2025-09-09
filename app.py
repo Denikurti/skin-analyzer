@@ -61,35 +61,38 @@ def skin_mask(bgr):
     m = morphology.remove_small_objects(m, min_size=500)
     return (m.astype(np.uint8) * 255)
 
-def face_mask_ellipse(bgr, exclude_lips=True):
+# ---------- face detection / masks ----------
+def detect_face_box(bgr):
+    """Return largest face box (x, y, w, h) or None."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(120, 120))
+    if len(faces) == 0:
+        return None
+    return max(faces, key=lambda r: r[2] * r[3])
+
+def face_mask_ellipse(bgr, exclude_lips=True, box=None):
     """
     Largest-face ellipse + optional lip/moustache exclusions.
     Falls back to full mask if no face is found.
     """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
+    if box is None:
+        box = detect_face_box(bgr)
 
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(120, 120)
-    )
-    h, w = gray.shape[:2]
+    h, w = bgr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    if len(faces) == 0:
+    if box is None:
         mask[:] = 255
         return mask
 
-    # Pick largest face
-    x, y, fw, fh = max(faces, key=lambda r: r[2] * r[3])
-
-    # Main face ellipse
+    x, y, fw, fh = box
     center = (x + fw // 2, y + fh // 2)
     axes   = (int(fw * 0.48), int(fh * 0.60))
     cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
 
     if exclude_lips:
-        # Mouth box (lower-center); tweak factors if needed
+        # Mouth box (lower-center)
         mx1 = x + int(0.18 * fw);  mx2 = x + int(0.82 * fw)
         my1 = y + int(0.58 * fh);  my2 = y + int(0.82 * fh)
         cv2.rectangle(mask, (mx1, my1), (mx2, my2), 0, -1)
@@ -99,27 +102,72 @@ def face_mask_ellipse(bgr, exclude_lips=True):
         sy1 = y + int(0.48 * fh);  sy2 = y + int(0.60 * fh)
         cv2.rectangle(mask, (sx1, sy1), (sx2, sy2), 0, -1)
 
-    # Smooth edges
     mask = cv2.GaussianBlur(mask, (11, 11), 0)
     return mask
 
-def redness_map(bgr):
-    # LAB a* channel captures red-green
+# ---------- redness features ----------
+def cheek_baseline_a(bgr, box):
+    """
+    Estimate LAB 'a*' baseline from cheek patches inside face box.
+    Returns (mean, std).
+    """
+    x, y, fw, fh = box
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     a = lab[:, :, 1].astype(np.float32)
-    a = (a - a.min()) / (a.max() - a.min() + 1e-6)
-    return (a * 255).astype(np.uint8)
 
-def detect_blemishes(bgr, mask, percentile=85):
-    red = redness_map(bgr)
-    red_skin = cv2.bitwise_and(red, red, mask=mask)
-    thr = np.percentile(red_skin[mask > 0], percentile) if np.any(mask > 0) else 255
-    hot = (red_skin >= thr).astype(np.uint8) * 255
-    hot = cv2.medianBlur(hot, 5)
-    hot = morphology.remove_small_objects(hot.astype(bool), min_size=80)
-    hot = morphology.remove_small_holes(hot, area_threshold=80)
-    return (hot.astype(np.uint8) * 255)
+    # Cheek windows relative to face box (tweakable)
+    lx1 = x + int(0.15 * fw); lx2 = x + int(0.40 * fw)
+    rx1 = x + int(0.60 * fw); rx2 = x + int(0.85 * fw)
+    cy1 = y + int(0.45 * fh); cy2 = y + int(0.70 * fh)
 
+    left  = a[cy1:cy2, lx1:lx2]
+    right = a[cy1:cy2, rx1:rx2]
+
+    def _safe_stats(arr, fallback):
+        if arr.size == 0: return fallback
+        mean = float(np.mean(arr)); std = float(np.std(arr))
+        if std < 1e-6: std = 1.0
+        return mean, std
+
+    meanL, stdL = _safe_stats(left,  (float(np.mean(a)), float(np.std(a)) + 1e-6))
+    meanR, stdR = _safe_stats(right, (float(np.mean(a)), float(np.std(a)) + 1e-6))
+
+    mean = (meanL + meanR) / 2.0
+    std  = (stdL + stdR) / 2.0
+    if std < 1e-6: std = 1.0
+    return mean, std
+
+def detect_blemishes(bgr, mask, percentile=85, face_box=None):
+    """
+    Δa*-aware hotspot detection:
+    - If face_box provided, compute z-score relative to cheek baseline (mean/std).
+    - Threshold by percentile inside the analysis mask.
+    - Clean with median filter + small object/holes removal.
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    a = lab[:, :, 1].astype(np.float32)
+
+    if face_box is not None:
+        mean, std = cheek_baseline_a(bgr, face_box)
+        metric = (a - mean) / (std + 1e-6)   # z-score (relative redness)
+    else:
+        # Fallback: use absolute a* (normalized)
+        amin, amax = a.min(), a.max()
+        metric = (a - amin) / (amax - amin + 1e-6)
+
+    # Percentile threshold inside the mask
+    vals = metric[mask > 0]
+    thr = np.percentile(vals, percentile) if vals.size else np.inf
+    hot = (metric >= thr) & (mask > 0)
+
+    # Denoise/cleanup
+    hot = cv2.medianBlur(hot.astype(np.uint8) * 255, 5)
+    hot_bool = hot.astype(bool)
+    hot_bool = morphology.remove_small_objects(hot_bool, min_size=80)
+    hot_bool = morphology.remove_small_holes(hot_bool, area_threshold=80)
+    return (hot_bool.astype(np.uint8) * 255)
+
+# ---------- scoring / rendering ----------
 def overlay_heatmap(bgr, hot):
     heat = cv2.applyColorMap(
         cv2.normalize(hot, None, 0, 255, cv2.NORM_MINMAX), cv2.COLORMAP_JET
@@ -148,7 +196,7 @@ def compute_confidence(mask, bgr):
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     std_brightness = np.std(gray[mask > 0]) if np.any(mask > 0) else 0.0
-    lighting_score = max(0.0, 1.0 - (std_brightness / 64.0))  # cap
+    lighting_score = max(0.0, 1.0 - (std_brightness / 64.0))
 
     confidence = 0.5 * area_ratio + 0.5 * lighting_score
     return round(float(min(max(confidence, 0.0), 1.0)), 2)
@@ -190,11 +238,13 @@ def index():
         bgr = preprocess(bgr)
         bgr = safe_resize(bgr)
 
+        # face + masks
+        face_box = detect_face_box(bgr)
+        face = face_mask_ellipse(bgr, exclude_lips=True, box=face_box)
         skin = skin_mask(bgr)
-        face = face_mask_ellipse(bgr)
         analysis_mask = cv2.bitwise_and(skin, face)
 
-        hot = detect_blemishes(bgr, analysis_mask, percentile=percentile)
+        hot = detect_blemishes(bgr, analysis_mask, percentile=percentile, face_box=face_box)
         overlay = overlay_heatmap(bgr, hot)
 
         # outputs
